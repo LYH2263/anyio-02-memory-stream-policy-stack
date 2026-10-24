@@ -119,6 +119,9 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._core._typedattr import TypedAttributeProvider as TypedAttributeProvider
     from ._core._typedattr import TypedAttributeSet as TypedAttributeSet
     from ._core._typedattr import typed_attribute as typed_attribute
+    from .streams.memory import (
+        memory_object_stream_policy as memory_object_stream_policy,
+    )
 
     # ruff: isort: off
     from . import (

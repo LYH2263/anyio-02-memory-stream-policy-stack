@@ -112,6 +112,7 @@ Streams and stream wrappers
 ---------------------------
 
 .. autofunction:: anyio.create_memory_object_stream
+.. autofunction:: anyio.memory_object_stream_policy
 
 .. autoclass:: anyio.abc.UnreliableObjectReceiveStream()
 .. autoclass:: anyio.abc.UnreliableObjectSendStream()
@@ -139,6 +140,10 @@ Streams and stream wrappers
 .. autoclass:: anyio.streams.file.FileStreamAttribute
 .. autoclass:: anyio.streams.file.FileReadStream
 .. autoclass:: anyio.streams.file.FileWriteStream
+.. autoclass:: anyio.streams.memory.BufferLedgerPolicy
+.. autoclass:: anyio.streams.memory.BlockedSendSurfacePolicy
+.. autoclass:: anyio.streams.memory.ChannelRefcountShutdownPolicy
+.. autoclass:: anyio.streams.memory.MemoryObjectStreamPolicy
 .. autoclass:: anyio.streams.memory.MemoryObjectReceiveStream
 .. autoclass:: anyio.streams.memory.MemoryObjectSendStream
 .. autoclass:: anyio.streams.memory.MemoryObjectStreamStatistics

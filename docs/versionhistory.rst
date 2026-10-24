@@ -3,6 +3,12 @@ Version history
 
 This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
+**UNRELEASED**
+
+- Added ``memory_object_stream_policy()`` for task-tree scoped, nestable memory object
+  stream policies covering buffer staging, full-buffer send behavior, sender-cancel
+  reclamation, and pin-compatible half-closing
+
 **4.15.1**
 
 - Implemented a compatibility fix for supporting direct access of ``anyio.*`` submodules

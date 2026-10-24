@@ -131,6 +131,91 @@ stream as a context manager::
         with send_stream:
             send_stream.send_nowait('hello')
 
+Task-tree policy stack
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Sometimes a bounded section of a task tree needs stricter local queue behavior than the
+stream was created with, for example failing immediately in a latency-sensitive branch
+or preventing the normal receive handoff from momentarily extending a full buffer.
+Use :func:`~anyio.memory_object_stream_policy` to push such a policy frame without
+changing ``max_buffer_size``, storing state on the stream, or closing and recreating the
+channel::
+
+    from anyio import WouldBlock, memory_object_stream_policy
+    from anyio.streams.memory import BlockedSendSurfacePolicy
+
+    fail_fast = BlockedSendSurfacePolicy(queue_waiters=False, fail_fast=True)
+    with memory_object_stream_policy(blocked_send_surface=fail_fast):
+        try:
+            await send_stream.send(item)
+        except WouldBlock:
+            ...  # apply backpressure without leaving a waiter in the stream
+
+The frame applies to the task that entered the context and to tasks spawned by that task
+or its descendants. Frames nest, and leaving the context (including through an exception
+or cancellation) restores the previous frame. Concurrent sibling task trees do not see
+each other's frames.
+
+The storage uses a :class:`~anyio.lowlevel.RunVar` as its first-level bucket, so
+different event loops or Trio tokens are isolated as usual. A ``RunVar`` is not, however,
+a task-tree boundary: multiple independent task trees can run in the same native event
+loop. AnyIO therefore keeps a second level of state keyed by root task and filters frames
+by the caller's ancestor chain. Do not rely on ``RunVar`` alone to scope these policies.
+
+Three independent policy dimensions are merged from the innermost applicable frame:
+
+* :class:`~anyio.streams.memory.BufferLedgerPolicy` controls capacity accounting.
+  ``steady_cap`` always remains enabled; policies can never increase the hard capacity
+  passed to :func:`~create_memory_object_stream`. By default
+  ``allow_receive_staging`` preserves the existing handoff in which a waiting sender's
+  item is appended before the old item is removed, briefly making ``len(buffer)`` equal
+  ``max_buffer_size + 1``. Setting ``allow_receive_staging=False`` and
+  ``forbid_staging_overshoot=True`` performs a direct handoff for capacity zero and a
+  one-for-one replacement otherwise.
+* :class:`~anyio.streams.memory.BlockedSendSurfacePolicy` controls a full buffer.
+  The default ``queue_waiters=True`` makes ``await send()`` join ``waiting_senders``.
+  Setting ``queue_waiters=False`` and ``fail_fast=True`` makes that blocking call raise
+  :exc:`~anyio.WouldBlock` immediately, just like ``send_nowait()``. The two send
+  entry points remain separate checks. With
+  ``reclaim_on_send_cancel=True``, cancellation of the sending task hands the item to a
+  ready receiver when possible, puts it back into the buffer when capacity permits, or
+  retains it as a non-waiting item until the next receive. The default continues to
+  remove and discard the canceled sender's item.
+* :class:`~anyio.streams.memory.ChannelRefcountShutdownPolicy` describes half-closing.
+  Only the existing values are accepted in this version: closing one clone leaves peers
+  blocked, closing the final receive clone wakes senders with
+  :exc:`~anyio.BrokenResourceError`, and closing the final send clone wakes receivers
+  with :exc:`~anyio.EndOfStream`.
+
+For example, forbid the transient full-buffer handoff inside one consumer branch::
+
+    from anyio import memory_object_stream_policy
+    from anyio.streams.memory import BufferLedgerPolicy
+
+    forbid_overshoot = BufferLedgerPolicy(
+        allow_receive_staging=False,
+        forbid_staging_overshoot=True,
+    )
+    with memory_object_stream_policy(buffer_ledger=forbid_overshoot):
+        item = await receive_stream.receive()
+
+Policy is resolved at each stream operation. A sender already queued before a frame was
+pushed is recalculated from its owner task's current ancestry when a receive tries to
+unblock it; a newly applicable fail-fast frame causes that sender to receive
+:exc:`~anyio.WouldBlock` rather than silently using the enqueue-time frame. Sender
+cancellation likewise reads the policy effective at cancellation. The synchronous
+staging section inside ``receive_nowait()`` cannot be interleaved by another task in the
+same event loop, so its receiver policy remains the policy resolved at that operation
+boundary.
+
+When no frame has ever been pushed, memory object streams retain their existing
+behavior, including the allowed transient staging length visible in statistics. These
+policies do not change pending-cancellation receiver handoff semantics, do not add
+parameters to :func:`~create_memory_object_stream`, and do not attach policy state to
+individual stream objects. They also do not apply to buffered byte streams, stapled
+object streams, internal test-runner channels, timeout/cancel scopes, thread offloading,
+blocking portals, or capacity limiters.
+
 Stapled streams
 ---------------
 

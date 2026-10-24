@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import sys
+from collections import deque
 from typing import TYPE_CHECKING, NoReturn
 
 import pytest
@@ -11,13 +12,19 @@ from anyio import (
     CancelScope,
     ClosedResourceError,
     EndOfStream,
+    Event,
     WouldBlock,
     create_memory_object_stream,
     create_task_group,
     fail_after,
+    get_available_backends,
+    memory_object_stream_policy,
     wait_all_tasks_blocked,
 )
 from anyio.streams.memory import (
+    BlockedSendSurfacePolicy,
+    BufferLedgerPolicy,
+    ChannelRefcountShutdownPolicy,
     MemoryObjectReceiveStream,
     MemoryObjectSendStream,
     _MemoryObjectItemReceiver,
@@ -524,3 +531,518 @@ async def test_memory_object_item_receiver_repr() -> None:
     receiver.item = "test_item"
     receiver_repr = repr(receiver)
     assert "item='test_item'" in receiver_repr
+
+
+policy_backend_params = [
+    pytest.param(("asyncio", {"debug": True}), id="asyncio"),
+    pytest.param(
+        "trio",
+        id="trio",
+        marks=pytest.mark.skipif(
+            "trio" not in get_available_backends(),
+            reason="trio is not available",
+        ),
+    ),
+]
+
+
+class _MaximumTrackingDeque(deque[str]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.maximum_length = 0
+
+    def append(self, item: str) -> None:
+        super().append(item)
+        self.maximum_length = max(self.maximum_length, len(self))
+
+    def seed(self, item: str) -> None:
+        self.append(item)
+
+
+_FORBID_STAGING = BufferLedgerPolicy(
+    allow_receive_staging=False,
+    forbid_staging_overshoot=True,
+)
+_FAIL_FAST = BlockedSendSurfacePolicy(queue_waiters=False, fail_fast=True)
+_RECLAIM = BlockedSendSurfacePolicy(reclaim_on_send_cancel=True)
+_PIN_SHUTDOWN = ChannelRefcountShutdownPolicy()
+
+
+def test_memory_stream_policy_validation() -> None:
+    pytest.raises(
+        ValueError,
+        BufferLedgerPolicy,
+        steady_cap=False,
+    )
+    pytest.raises(
+        ValueError,
+        BufferLedgerPolicy,
+        allow_receive_staging=False,
+        forbid_staging_overshoot=False,
+    )
+    pytest.raises(
+        ValueError,
+        BufferLedgerPolicy,
+        allow_receive_staging=True,
+        forbid_staging_overshoot=True,
+    )
+    pytest.raises(
+        ValueError,
+        BlockedSendSurfacePolicy,
+        queue_waiters=False,
+        fail_fast=False,
+    )
+    pytest.raises(
+        ValueError,
+        BlockedSendSurfacePolicy,
+        queue_waiters=True,
+        fail_fast=True,
+    )
+    pytest.raises(
+        ValueError,
+        ChannelRefcountShutdownPolicy,
+        last_receiver_breaks_senders=False,
+    )
+
+
+async def test_memory_stream_policy_restored_after_exception() -> None:
+    send, receive = create_memory_object_stream[str](1)
+    send.send_nowait("hello")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with memory_object_stream_policy(blocked_send_surface=_FAIL_FAST):
+            raise RuntimeError("boom")
+
+    async with create_task_group() as tg:
+        tg.start_soon(send.send, "anyio")
+        await wait_all_tasks_blocked()
+        assert send.statistics().tasks_waiting_send == 1
+        assert receive.receive_nowait() == "hello"
+
+    assert receive.receive_nowait() == "anyio"
+    send.close()
+    receive.close()
+
+
+async def test_memory_stream_policy_nested_frame_restoration() -> None:
+    send, receive = create_memory_object_stream[str](1)
+    send.send_nowait("hello")
+
+    with memory_object_stream_policy():
+        with memory_object_stream_policy(
+            buffer_ledger=_FORBID_STAGING,
+            blocked_send_surface=_FAIL_FAST,
+            channel_refcount_shutdown=_PIN_SHUTDOWN,
+        ):
+            with pytest.raises(WouldBlock):
+                await send.send("anyio")
+
+        async with create_task_group() as tg:
+            tg.start_soon(send.send, "anyio")
+            await wait_all_tasks_blocked()
+            buffer = _MaximumTrackingDeque()
+            buffer.seed("hello")
+            send._state.buffer = buffer
+            assert receive.receive_nowait() == "hello"
+
+    assert buffer.maximum_length == 2
+    assert receive.receive_nowait() == "anyio"
+    send.close()
+    receive.close()
+
+
+async def test_memory_stream_policy_fail_fast_send() -> None:
+    send, receive = create_memory_object_stream[str](1)
+    send.send_nowait("hello")
+    with memory_object_stream_policy(blocked_send_surface=_FAIL_FAST):
+        with pytest.raises(WouldBlock):
+            await send.send("anyio")
+
+    assert send.statistics().tasks_waiting_send == 0
+    with pytest.raises(WouldBlock):
+        send.send_nowait("anyio")
+
+    assert receive.receive_nowait() == "hello"
+    send.close()
+    receive.close()
+
+
+@pytest.mark.parametrize("anyio_backend", policy_backend_params)
+async def test_memory_stream_policy_receive_staging_window() -> None:
+    send, receive = create_memory_object_stream[str](1)
+    send.send_nowait("hello")
+
+    async with create_task_group() as tg:
+        tg.start_soon(send.send, "anyio")
+        await wait_all_tasks_blocked()
+        buffer = _MaximumTrackingDeque()
+        buffer.seed("hello")
+        send._state.buffer = buffer
+        assert receive.receive_nowait() == "hello"
+
+    assert buffer.maximum_length == 2
+    assert receive.receive_nowait() == "anyio"
+    send.close()
+    receive.close()
+
+
+@pytest.mark.parametrize("anyio_backend", policy_backend_params)
+async def test_memory_stream_policy_forbid_receive_staging_overshoot() -> None:
+    send, receive = create_memory_object_stream[str](1)
+    send.send_nowait("hello")
+
+    async with create_task_group() as tg:
+        tg.start_soon(send.send, "anyio")
+        await wait_all_tasks_blocked()
+        buffer = _MaximumTrackingDeque()
+        buffer.seed("hello")
+        send._state.buffer = buffer
+        with memory_object_stream_policy(buffer_ledger=_FORBID_STAGING):
+            assert receive.receive_nowait() == "hello"
+
+    assert buffer.maximum_length == 1
+    assert receive.receive_nowait() == "anyio"
+    send.close()
+    receive.close()
+
+
+@pytest.mark.parametrize("anyio_backend", policy_backend_params)
+async def test_memory_stream_policy_forbid_staging_zero_capacity() -> None:
+    send, receive = create_memory_object_stream[str](0)
+
+    async with create_task_group() as tg:
+        tg.start_soon(send.send, "hello")
+        await wait_all_tasks_blocked()
+        with memory_object_stream_policy(buffer_ledger=_FORBID_STAGING):
+            assert receive.receive_nowait() == "hello"
+
+    assert receive.statistics().current_buffer_used == 0
+    send.close()
+    receive.close()
+
+
+@pytest.mark.parametrize("anyio_backend", policy_backend_params)
+async def test_memory_stream_policy_cancel_send_default_discards() -> None:
+    send, receive = create_memory_object_stream[str](0)
+    async with create_task_group() as tg:
+        tg.start_soon(send.send, "hello")
+        await wait_all_tasks_blocked()
+        tg.cancel_scope.cancel()
+
+    with pytest.raises(WouldBlock):
+        receive.receive_nowait()
+
+    send.close()
+    receive.close()
+
+
+@pytest.mark.parametrize("anyio_backend", policy_backend_params)
+async def test_memory_stream_policy_cancel_send_reclaims_item() -> None:
+    send, receive = create_memory_object_stream[str](0)
+    with memory_object_stream_policy(blocked_send_surface=_RECLAIM):
+        async with create_task_group() as tg:
+            tg.start_soon(send.send, "hello")
+            await wait_all_tasks_blocked()
+            tg.cancel_scope.cancel()
+
+        assert send.statistics().tasks_waiting_send == 0
+
+    assert receive.receive_nowait() == "hello"
+    send.close()
+    receive.close()
+
+
+@pytest.mark.parametrize("anyio_backend", policy_backend_params)
+async def test_memory_stream_policy_reclaim_hands_item_to_receiver() -> None:
+    send, receive = create_memory_object_stream[str](0)
+    received_items: list[str] = []
+    sender_scope = CancelScope()
+
+    async def send_item() -> None:
+        with sender_scope:
+            await send.send("hello")
+
+    async def receive_item() -> None:
+        received_items.append(await receive.receive())
+
+    with memory_object_stream_policy(blocked_send_surface=_RECLAIM):
+        async with create_task_group() as tg:
+            tg.start_soon(send_item)
+            await wait_all_tasks_blocked()
+            tg.start_soon(receive_item)
+            await wait_all_tasks_blocked()
+            sender_scope.cancel()
+
+    assert received_items == ["hello"]
+    with pytest.raises(WouldBlock):
+        receive.receive_nowait()
+
+    send.close()
+    receive.close()
+
+
+@pytest.mark.parametrize("anyio_backend", policy_backend_params)
+async def test_memory_stream_policy_retained_item_discarded_when_broken() -> None:
+    send, receive = create_memory_object_stream[str](1)
+    send.send_nowait("hello")
+    sender_scope = CancelScope()
+
+    async def send_item() -> None:
+        with sender_scope:
+            await send.send("anyio")
+
+    with memory_object_stream_policy(blocked_send_surface=_RECLAIM):
+        async with create_task_group() as tg:
+            tg.start_soon(send_item)
+            await wait_all_tasks_blocked()
+            sender_scope.cancel()
+
+    assert send.statistics().tasks_waiting_send == 0
+    assert len(send._state.waiting_senders) == 1
+    receive.close()
+    assert len(send._state.waiting_senders) == 0
+    send.close()
+
+
+@pytest.mark.parametrize("anyio_backend", policy_backend_params)
+async def test_memory_stream_policy_recalculates_waiting_sender() -> None:
+    send, receive = create_memory_object_stream[str](1)
+    send.send_nowait("hello")
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        async with create_task_group() as tg:
+            tg.start_soon(send.send, "anyio")
+            await wait_all_tasks_blocked()
+            with memory_object_stream_policy(blocked_send_surface=_FAIL_FAST):
+                assert receive.receive_nowait() == "hello"
+
+    assert len(exc_info.value.exceptions) == 1
+    assert isinstance(exc_info.value.exceptions[0], WouldBlock)
+    with pytest.raises(WouldBlock):
+        receive.receive_nowait()
+
+    send.close()
+    receive.close()
+
+
+async def test_memory_stream_policy_partial_receive_clone_keeps_sender_blocked() -> (
+    None
+):
+    send, receive = create_memory_object_stream[None](0)
+    receive2 = receive.clone()
+    with memory_object_stream_policy(channel_refcount_shutdown=_PIN_SHUTDOWN):
+        with pytest.raises(ExceptionGroup) as exc_info:
+            async with create_task_group() as tg:
+                tg.start_soon(send.send, None)
+                await wait_all_tasks_blocked()
+                receive.close()
+                await wait_all_tasks_blocked()
+                assert send.statistics().tasks_waiting_send == 1
+                receive2.close()
+                with memory_object_stream_policy(blocked_send_surface=_FAIL_FAST):
+                    pass
+
+    assert isinstance(exc_info.value.exceptions[0], BrokenResourceError)
+    send.close()
+    receive2.close()
+
+
+async def test_memory_stream_policy_partial_send_clone_keeps_receiver_blocked() -> None:
+    send, receive = create_memory_object_stream[None](0)
+    send2 = send.clone()
+    with memory_object_stream_policy(channel_refcount_shutdown=_PIN_SHUTDOWN):
+        with pytest.raises(ExceptionGroup) as exc_info:
+            async with create_task_group() as tg:
+                tg.start_soon(receive.receive)
+                await wait_all_tasks_blocked()
+                send.close()
+                await wait_all_tasks_blocked()
+                assert receive.statistics().tasks_waiting_receive == 1
+                send2.close()
+                with memory_object_stream_policy(blocked_send_surface=_FAIL_FAST):
+                    pass
+
+    assert isinstance(exc_info.value.exceptions[0], EndOfStream)
+    send2.close()
+    receive.close()
+
+
+async def test_memory_stream_policy_async_iteration_drains_before_eos() -> None:
+    send, receive = create_memory_object_stream[str](1)
+    with memory_object_stream_policy(channel_refcount_shutdown=_PIN_SHUTDOWN):
+        cloned_receive = receive.clone()
+        await send.send("hello")
+        await send.aclose()
+        assert [item async for item in receive] == ["hello"]
+
+    with pytest.raises(EndOfStream):
+        cloned_receive.receive_nowait()
+
+    receive.close()
+    cloned_receive.close()
+
+
+@pytest.mark.parametrize("anyio_backend", policy_backend_params)
+async def test_memory_stream_policy_concurrent_send_surface_isolation() -> None:
+    proceed = Event()
+    fail_ready = Event()
+    queue_ready = Event()
+    results: list[str] = []
+
+    async def fail_fast_host() -> None:
+        send, receive = create_memory_object_stream[str](1)
+        send.send_nowait("a")
+
+        async def send_item() -> None:
+            await proceed.wait()
+            try:
+                await send.send("b")
+            except WouldBlock:
+                results.append("fail-fast")
+
+        async with create_task_group() as tg:
+            with memory_object_stream_policy(blocked_send_surface=_FAIL_FAST):
+                tg.start_soon(send_item)
+                fail_ready.set()
+                await wait_all_tasks_blocked()
+                await proceed.wait()
+                await wait_all_tasks_blocked()
+
+        send.close()
+        receive.close()
+
+    async def queue_waiters_host() -> None:
+        send, receive = create_memory_object_stream[str](1)
+        send.send_nowait("a")
+
+        async def send_item() -> None:
+            await proceed.wait()
+            await send.send("b")
+
+        async with create_task_group() as tg:
+            with memory_object_stream_policy():
+                tg.start_soon(send_item)
+                queue_ready.set()
+                await proceed.wait()
+                await wait_all_tasks_blocked()
+                assert send.statistics().tasks_waiting_send == 1
+                assert receive.receive_nowait() == "a"
+            assert receive.receive_nowait() == "b"
+
+        send.close()
+        receive.close()
+
+    async with create_task_group() as tg:
+        tg.start_soon(fail_fast_host)
+        tg.start_soon(queue_waiters_host)
+        await fail_ready.wait()
+        await queue_ready.wait()
+        proceed.set()
+
+    assert results == ["fail-fast"]
+
+
+@pytest.mark.parametrize("anyio_backend", policy_backend_params)
+async def test_memory_stream_policy_concurrent_staging_isolation() -> None:
+    proceed = Event()
+    forbid_ready = Event()
+    allow_ready = Event()
+
+    async def staging_host(
+        forbid: bool,
+        ready: Event,
+        expected_maximum: int,
+    ) -> None:
+        send, receive = create_memory_object_stream[str](1)
+        send.send_nowait("a")
+
+        async def send_item() -> None:
+            await proceed.wait()
+            await send.send("b")
+
+        async with create_task_group() as tg:
+            tg.start_soon(send_item)
+            ready.set()
+            await proceed.wait()
+            await wait_all_tasks_blocked()
+            buffer = _MaximumTrackingDeque()
+            buffer.seed("a")
+            send._state.buffer = buffer
+            if forbid:
+                with memory_object_stream_policy(buffer_ledger=_FORBID_STAGING):
+                    assert receive.receive_nowait() == "a"
+            else:
+                assert receive.receive_nowait() == "a"
+
+            assert buffer.maximum_length == expected_maximum
+            assert receive.receive_nowait() == "b"
+
+        send.close()
+        receive.close()
+
+    async with create_task_group() as tg:
+        tg.start_soon(staging_host, True, forbid_ready, 1)
+        tg.start_soon(staging_host, False, allow_ready, 2)
+        await forbid_ready.wait()
+        await allow_ready.wait()
+        proceed.set()
+
+
+@pytest.mark.parametrize("anyio_backend", policy_backend_params)
+async def test_memory_stream_policy_concurrent_shutdown_isolation() -> None:
+    proceed = Event()
+    partial_ready = Event()
+    final_ready = Event()
+    results: list[str] = []
+
+    async def shutdown_host(
+        partial_clone: bool,
+        ready: Event,
+        result: str,
+    ) -> None:
+        send, receive = create_memory_object_stream[None](0)
+        extra_receive: MemoryObjectReceiveStream[None] | None = None
+
+        async def send_until_broken() -> None:
+            await proceed.wait()
+            await send.send(None)
+
+        try:
+            with memory_object_stream_policy(channel_refcount_shutdown=_PIN_SHUTDOWN):
+                if partial_clone:
+                    extra_receive = receive.clone()
+
+                try:
+                    async with create_task_group() as tg:
+                        tg.start_soon(send_until_broken)
+                        ready.set()
+                        await proceed.wait()
+                        await wait_all_tasks_blocked()
+                        receive.close()
+                        if partial_clone:
+                            await wait_all_tasks_blocked()
+                            assert send.statistics().tasks_waiting_send == 1
+                            assert extra_receive is not None
+                            extra_receive.close()
+                except ExceptionGroup as exc:
+                    if all(
+                        isinstance(exc_value, BrokenResourceError)
+                        for exc_value in exc.exceptions
+                    ):
+                        results.append(result)
+                    else:
+                        raise
+        finally:
+            send.close()
+            receive.close()
+            if extra_receive is not None:
+                extra_receive.close()
+
+    async with create_task_group() as tg:
+        tg.start_soon(shutdown_host, True, partial_ready, "partial")
+        tg.start_soon(shutdown_host, False, final_ready, "final")
+        await partial_ready.wait()
+        await final_ready.wait()
+        proceed.set()
+
+    assert sorted(results) == ["final", "partial"]
